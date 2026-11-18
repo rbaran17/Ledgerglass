@@ -49,14 +49,14 @@
     "prepack": "npm run build:lib"
   },
   "dependencies": {
-    "@assistant-ui/react": "0.15.33",
+    "@assistant-ui/react": "0.15.36",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "exceljs": "4.4.0",
     "fast-formula-parser": "1.0.19",
     "fflate": "^0.8.3",
     "html-to-image": "1.11.13",
-    "lucide-react": "^1.70.0",
-    "papaparse": "^5.5.3",
+    "lucide-react": "^1.73.0",
+    "papaparse": "^5.7.1",
     "pdf-lib": "1.17.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
@@ -67,7 +67,7 @@
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "1.8.0",
-    "@playwright/test": "^1.65.0",
+    "@playwright/test": "^1.65.1",
     "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "13.5.0",
     "@types/node": "^22.15.0",
@@ -77,8 +77,8 @@
     "@vitejs/plugin-react": "^4.5.0",
     "axe-core": "4.14.0",
     "esbuild": "0.28.2",
-    "jsdom": "^31.0.0",
-    "prettier": "^3.9.10",
+    "jsdom": "^31.0.1",
+    "prettier": "^3.10.1",
     "typescript": "^5.8.3",
     "vite": "^6.4.1",
     "vitest": "^5.1.0"
