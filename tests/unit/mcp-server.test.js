@@ -5,7 +5,18 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { createBlankWorkbook } from "../../src/app/03-workbook-model.js";
+import {
+  addWorksheet,
+  createBlankWorkbook,
+  getWorkbookCalculation,
+} from "../../src/app/03-workbook-model.js";
+import {
+  buildAssistantSelectionContext,
+  createApprovedSelectionCalculator,
+  validateAssistantFormula,
+  validateAssistantProposal,
+  validateProposedCalculation,
+} from "../../src/app/19b-assistant-protocol.js";
 import { createWorkbookMcpServer } from "../../src/mcp/server.js";
 
 function ledger() {
@@ -251,6 +262,272 @@ describe("MCP server", () => {
     expect(() => createWorkbookMcpServer({ getWorkbook: () => ({}) })).toThrow(
       /getSelection/,
     );
+  });
+});
+
+/** A1:B2 of the first sheet is the approved selection. Every other cell here is outside it. */
+function payroll() {
+  let workbook = createBlankWorkbook("Payroll");
+  Object.assign(workbook.sheets[0].cells, {
+    A1: { raw: "Item" },
+    B1: { raw: "Cost" },
+    A2: { raw: 2 },
+    // Approved, and its own formula reads a cell outside the selection.
+    B2: { raw: "=G8*100" },
+    F7: { raw: "CEO salary" },
+    G7: { raw: 987654 },
+    G8: { raw: 12 },
+    A40: { raw: "bank password: hunter2" },
+    LOG10: { raw: "a cell named like a function" },
+  });
+  workbook = addWorksheet(workbook, '2" valves');
+  workbook.sheets[1].cells.Z50 = { raw: "on another sheet" };
+  return workbook;
+}
+const payrollApproved = new Set(["A1", "B1", "A2", "B2"]);
+const outsideData =
+  /CEO salary|987654|hunter2|named like a function|another sheet/;
+
+/**
+ * Formulas that got past an earlier check, each with what the calculation engine answers when
+ * nothing stops it. The engine reads any number beside ":" as a whole row.
+ */
+const formulasThatReadOutside = [
+  ["=INDEX(7:7,1,7)", 987654],
+  ['=TEXTJOIN("|",TRUE,7:7,40:40)', "CEO salary|987654|bank password: hunter2"],
+  ["=INDEX((7):(7),1,7)", 987654],
+  ["=INDEX(7:SUM(7),1,7)", 987654],
+  ["=INDEX(7.0:7.0,1,7)", 987654],
+  ["=INDEX(A1:(7),7,7)", 987654],
+  ["=INDEX(A1:B2:7,7,7)", 987654],
+  ["=INDEX((A2+5):(A2+5),1,7)", 987654],
+  ['=XLOOKUP("CEO salary",7:7,7:7)', "CEO salary"],
+  // The lexer reads "LOG10 (" as cell LOG10, not as a call of LOG10.
+  ["=CONCAT(LOG10 (10:10))", "a cell named like a function"],
+  // A double quote in a sheet name must not hide the "!" as part of a string.
+  [`='2" valves'!Z50&""`, "on another sheet"],
+  // Names bound by LET are values, so beside ":" they are rows too.
+  ["=LET(n,7,INDEX(n : n,1,7))", 987654],
+  ["=LET(n,7,INDEX((n):(n),1,7))", 987654],
+  ["=INDEX(SUM(7):SUM(7),1,7)", 987654],
+  ["=G7", 987654],
+  ["=F7&$G$7", "CEO salary987654"],
+];
+
+/** Further shapes that must be refused, whatever the engine would answer. */
+const otherFormulasOutside = [
+  '=XLOOKUP("x",7:7,7:7)',
+  "=SUM(A:B)",
+  "=SUM(1:1)",
+  "=SUM(A1:B2:G7)",
+  "=SUM(A1:G7)",
+  "=SUM(A1:B2,7:7)",
+  "=SUM(A1:B2 7:7)",
+  "=LET(a,A1,b,B2,SUM(a:b))",
+  "=LOG10 (A2)",
+  "=SUM (7:7)",
+  "=_xlfn.CONCAT(7:7)",
+  "=Sheet1!G7",
+  "=A1#",
+  "=Table1[Cost]",
+  "=Budget",
+  "=TRUE1",
+  "=2A2",
+  "=LET(x,1,y)",
+  '=INDIRECT("G7")',
+  "=OFFSET(A1,6,6)",
+  "='Sheet1'!G7",
+  "=A2:INDEX(A1:B2,2,2)",
+];
+
+/** Ordinary formulas over the approved selection, with their results. */
+const formulasInsideSelection = [
+  ["=B2*2", 2400],
+  ["=SUM(A2:B2)", 1202],
+  ["=SUM($A$2:$B$2)*2", 2404],
+  ["=SUM(A2 : B2)", 1202],
+  ["=sum(b2:a2)", 1202],
+  ['=IF(B2>1000,"it\'s: high","low")', "it's: high"],
+  ['=TEXT(B2,"0.00")', "1200.00"],
+  ['=TEXTJOIN(",",TRUE,A1:B2)', "Item,Cost,2,1200"],
+  ['=ROUND(B2/7,2)&"%"', "171.43%"],
+  ["=INDEX(A1:B2,2,2)", 1200],
+  ["=VLOOKUP(2,A2:B2,2,FALSE)", 1200],
+  ["=IF(TRUE,A2,B2)", 2],
+  ["=A2:B2 B1:B2", 1200],
+  ["=2E+3+B2", 3200],
+  ["=SUM({1,2;3,4})+A2", 12],
+  ["=LET(rate,0.5,B2*rate)", 600],
+  ["=LET(x,A2,y,B2,x+y)", 1202],
+  ["=LET(k,1e3,B2/k)", 1.2],
+  ["=LAMBDA(v,v*2)(B2)", 2400],
+  ["=LET(double,LAMBDA(v,v*2),double(B2))", 2400],
+];
+
+describe("assistant formulas stay inside the approved selection", () => {
+  test.each(formulasThatReadOutside)(
+    "the formula check refuses %s",
+    async (formula) => {
+      expect(() =>
+        validateAssistantFormula(formula, payrollApproved),
+      ).toThrow();
+      const workbook = payroll();
+      const sheetId = workbook.sheets[0].id;
+      const { call, queued } = await connect(workbook, "A1:B2");
+      const evaluated = await call("workbook_evaluate_formula", { formula });
+      expect(evaluated.error).toBeTruthy();
+      expect(JSON.stringify(evaluated)).not.toMatch(outsideData);
+      const inspected = await call("workbook_inspect_formula", { formula });
+      expect(inspected.proposable).toBe(false);
+      const proposed = await call("workbook_queue_proposal", {
+        proposal: proposalFor(
+          workbook,
+          [{ sheetId, address: "A2", cell: { raw: formula } }],
+          { citations: [] },
+        ),
+      });
+      expect(proposed.error).toBeTruthy();
+      expect(queued).toHaveLength(0);
+    },
+  );
+
+  test.each(otherFormulasOutside)("the formula check refuses %s", (formula) => {
+    expect(() => validateAssistantFormula(formula, payrollApproved)).toThrow();
+  });
+
+  test("a range needs every cell of its rectangle approved, not only its two ends", () => {
+    const corners = new Set(["A1", "B2"]);
+    expect(() => validateAssistantFormula("=A1+B2", corners)).not.toThrow();
+    expect(() => validateAssistantFormula("=SUM(A1:B2)", corners)).toThrow(
+      /approved selection/,
+    );
+  });
+
+  test.each(formulasInsideSelection)(
+    "%s is accepted and calculated",
+    async (formula, result) => {
+      expect(() =>
+        validateAssistantFormula(formula, payrollApproved),
+      ).not.toThrow();
+      const { call } = await connect(payroll(), "A1:B2");
+      const evaluated = await call("workbook_evaluate_formula", { formula });
+      expect(evaluated.result).toBe(result);
+      const inspected = await call("workbook_inspect_formula", { formula });
+      expect(inspected.proposable).toBe(true);
+    },
+  );
+
+  // The second guard on its own: no formula check runs in this test.
+  test.each(formulasThatReadOutside)(
+    "the approved-selection calculator alone blocks %s",
+    (formula, engineAnswer) => {
+      const workbook = payroll();
+      const sheetId = workbook.sheets[0].id;
+      const unguarded = getWorkbookCalculation(workbook).calculator;
+      expect(unguarded.evaluateFormula(sheetId, "A1", formula)).toBe(
+        engineAnswer,
+      );
+      const calculator = createApprovedSelectionCalculator(
+        workbook,
+        sheetId,
+        payrollApproved,
+      );
+      expect(calculator.evaluateFormula(sheetId, "A1", formula)).toBe(
+        "#BLOCKED!",
+      );
+      expect(calculator.readWasRefused()).toBe(true);
+    },
+  );
+
+  test("the approved-selection calculator reports a refused read that the formula hides", () => {
+    const workbook = payroll();
+    const sheetId = workbook.sheets[0].id;
+    const calculator = createApprovedSelectionCalculator(
+      workbook,
+      sheetId,
+      payrollApproved,
+    );
+    expect(
+      calculator.evaluateFormula(sheetId, "A1", '=IFERROR(G7,"hidden")'),
+    ).toBe("hidden");
+    expect(calculator.readWasRefused()).toBe(true);
+  });
+
+  test("the approved-selection calculator gives approved cells their calculated values", () => {
+    const workbook = payroll();
+    const sheetId = workbook.sheets[0].id;
+    const calculator = createApprovedSelectionCalculator(
+      workbook,
+      sheetId,
+      payrollApproved,
+    );
+    // B2 is =G8*100. Its value is approved; G8 itself is not.
+    expect(calculator.evaluateFormula(sheetId, "A1", "=B2+A2")).toBe(1202);
+    expect(calculator.evaluateFormula(sheetId, "A1", "=FORMULATEXT(B2)")).toBe(
+      "=G8*100",
+    );
+    expect(calculator.readWasRefused()).toBe(false);
+    expect(calculator.evaluateFormula(sheetId, "A1", "=G8")).toBe("#BLOCKED!");
+    expect(calculator.readWasRefused()).toBe(true);
+  });
+
+  test("a formula the check accepts is still refused when it reads outside: a defined name called TRUE", async () => {
+    // The formula check cannot see the workbook's names, and the engine expands a name called
+    // TRUE where the check sees the constant. Only the second guard can stop this one.
+    const workbook = payroll();
+    workbook.definedNames = [{ name: "TRUE", refersTo: "=Sheet1!$G$7" }];
+    const sheetId = workbook.sheets[0].id;
+    const formula = "=TRUE+0";
+    expect(() =>
+      validateAssistantFormula(formula, payrollApproved),
+    ).not.toThrow();
+    expect(
+      getWorkbookCalculation(workbook).calculator.evaluateFormula(
+        sheetId,
+        "A1",
+        formula,
+      ),
+    ).toBe(987654);
+
+    const { call } = await connect(workbook, "A1:B2");
+    const evaluated = await call("workbook_evaluate_formula", { formula });
+    expect(evaluated.error).toMatch(/approved selection/);
+    expect(JSON.stringify(evaluated)).not.toMatch(outsideData);
+
+    // The editor's own check of a proposal refuses it the same way.
+    const selection = { sheetId, range: "A1:B2" };
+    const proposal = proposalFor(
+      workbook,
+      [{ sheetId, address: "A2", cell: { raw: formula } }],
+      { citations: [] },
+    );
+    expect(() =>
+      validateAssistantProposal(
+        proposal,
+        buildAssistantSelectionContext(workbook, selection),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateProposedCalculation(workbook, selection, proposal),
+    ).toThrow(/approved selection/);
+  });
+
+  test("the editor's check of a proposal accepts an ordinary formula and refuses one that reads outside", () => {
+    const workbook = payroll();
+    const sheetId = workbook.sheets[0].id;
+    const selection = { sheetId, range: "A1:B2" };
+    const propose = (raw) =>
+      validateProposedCalculation(
+        workbook,
+        selection,
+        proposalFor(workbook, [{ sheetId, address: "A2", cell: { raw } }], {
+          citations: [],
+        }),
+      );
+    expect(propose("=B2*2").patches[0].cell.raw).toBe("=B2*2");
+    expect(propose("=LET(rate,0.5,B2*rate)").patches).toHaveLength(1);
+    for (const [formula] of formulasThatReadOutside)
+      expect(() => propose(formula)).toThrow();
   });
 });
 

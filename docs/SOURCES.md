@@ -232,8 +232,14 @@ const handleSources = createSourceGatewayHttpHandler(gateway, {
 });
 
 createServer(async (request, response) => {
-  if (await handleSources(request, response)) return;
-  response.writeHead(404).end();
+  try {
+    if (await handleSources(request, response)) return;
+    response.writeHead(404).end();
+  } catch {
+    // Node ends the process when an async listener rejects. Answer instead.
+    if (!response.headersSent) response.writeHead(500);
+    response.end();
+  }
 }).listen(8080);
 ```
 
@@ -245,7 +251,7 @@ What each part does:
 - **Neither has a default that allows access.** Both are required, and `createSourceGateway` and `createSourceGatewayHttpHandler` throw `TypeError` if either is missing. Pass `() => true` only for a server with no users to tell apart.
 - **An unknown source and a forbidden source get the same reply:** `403` with the `refused` code and the same message. The caller cannot learn which sources exist.
 
-The handler answers only `POST` on its path and returns `false` for any other path, so you can serve other routes from the same server. A runnable version that drives the editor's dialog is in `examples/source-gateway` in the repository.
+The handler answers only `POST` on its path and returns `false` for any other path, so you can serve other routes from the same server. A request target that is not a URL, such as `//`, is another path too: the handler returns `false` and does not throw. Keep the `try`/`catch` around your own routes all the same, because Node ends the process when an `async` listener rejects. A runnable version that drives the editor's dialog is in `examples/source-gateway` in the repository.
 
 ## 4. Connectors
 

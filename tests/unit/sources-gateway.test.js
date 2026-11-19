@@ -1,5 +1,6 @@
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { connect } from "node:net";
 import { afterAll, describe, expect, test, vi } from "vitest";
 import {
   ExternalSourceError,
@@ -160,6 +161,21 @@ async function startSourceServer({
   servers.push(server);
   const origin = `http://127.0.0.1:${server.address().port}`;
   return { origin, url: `${origin}/api/sources`, seen, handled, server };
+}
+
+/** The status line a server answers to a raw request target. fetch cannot send a target such as "//". */
+function statusLineFor(port, target, method = "POST") {
+  return new Promise((resolve, reject) => {
+    let reply = "";
+    const socket = connect(port, "127.0.0.1", () =>
+      socket.write(
+        `${method} ${target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-User: alice\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`,
+      ),
+    );
+    socket.on("data", (chunk) => (reply += chunk));
+    socket.on("close", () => resolve(reply.split("\r\n")[0]));
+    socket.on("error", reject);
+  });
 }
 
 function post(url, body, headers = {}) {
@@ -800,6 +816,36 @@ describe("HTTP handler over a real server", () => {
     });
     expect(wrongMethod.status).toBe(405);
     expect(wrongMethod.headers.get("allow")).toBe("POST");
+  });
+
+  // Each of these makes `new URL(target, base)` throw. They arrive before anyone is authenticated.
+  const targetsThatAreNotUrls = ["//", "//[", "//a:b", "/\\["];
+
+  test("a request target that is not a URL is another path, not an exception", async () => {
+    const authenticate = vi.fn(() => ({ name: "alice" }));
+    const handler = createSourceGatewayHttpHandler(makeGateway(), {
+      authenticate,
+    });
+    for (const target of targetsThatAreNotUrls)
+      await expect(
+        handler({ url: target, method: "POST", headers: {} }, {}),
+      ).resolves.toBe(false);
+    expect(authenticate).not.toHaveBeenCalled();
+  });
+
+  test("a server keeps answering after request targets that are not URLs", async () => {
+    const source = await startSourceServer();
+    const { port } = source.server.address();
+    for (const target of targetsThatAreNotUrls) {
+      expect(await statusLineFor(port, target)).toBe("HTTP/1.1 404 Not Found");
+      expect(source.handled.at(-1)).toBe(false);
+    }
+    expect(source.seen).toHaveLength(0);
+    expect(await statusLineFor(port, "/api/sources?x=%")).toBe(
+      "HTTP/1.1 400 Bad Request",
+    );
+    const catalog = await post(source.url, { operation: "catalog" });
+    expect(catalog.status).toBe(200);
   });
 
   test("415 without a JSON content type", async () => {

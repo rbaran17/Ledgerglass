@@ -265,7 +265,8 @@ export const sourceErrorStatus = Object.freeze({
  * @param options.maxBodyBytes  Default 4096; a protocol request is tiny.
  * @param options.timeoutMs     Per-request limit. Default and maximum: the protocol's 30 seconds.
  * @returns `async (request, response) => boolean`: true if it handled the request, false if the
- *   path is not this endpoint (so it can sit beside other routes).
+ *   path is not this endpoint (so it can sit beside other routes). A request target that is not a
+ *   URL, such as "//", is not this endpoint either: the handler returns false and does not throw.
  */
 export function createSourceGatewayHttpHandler(gateway, options = {}) {
   if (typeof options.authenticate !== "function")
@@ -297,8 +298,15 @@ export function createSourceGatewayHttpHandler(gateway, options = {}) {
   };
 
   return async function handleSourceRequest(request, response) {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    if (url.pathname !== path) return false;
+    // Nothing is authenticated yet, so the request target must never make this throw: "//" and
+    // "//[" are not URLs. A target that cannot be read is not this endpoint's path.
+    let pathname;
+    try {
+      pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    } catch {
+      return false;
+    }
+    if (pathname !== path) return false;
     if (request.method !== "POST") {
       response.writeHead(405, { Allow: "POST" });
       response.end();

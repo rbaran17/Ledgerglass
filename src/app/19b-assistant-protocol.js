@@ -3,9 +3,11 @@ import {
   normalizeBindingName,
   normalizeDatePolicy,
   tokenizeFormulaText,
+  unwrapDefaultExport,
   walkFormulaNodes,
   workbookUsesNowOrToday,
 } from "./01-schemas-date-functions-and-validation.js";
+import formulaLexerModule from "fast-formula-parser/grammar/lexing.js";
 import { array, discriminatedUnion, literal, object, string } from "zod";
 import {
   builtinFunctionNames,
@@ -524,72 +526,265 @@ function buildAssistantSelectionContext(workbook, selection) {
     })),
   };
 }
+/*
+ * The calculation engine's own lexer. An assistant formula is checked as the
+ * tokens the engine will read, so the check and the engine cannot disagree on
+ * where a string ends, what a function call is or what a reference is.
+ */
+const formulaLexer = unwrapDefaultExport(formulaLexerModule);
+const assistantFormulaMessages = {
+  reference:
+    "Assistant formulas cannot reference other worksheets, external workbooks, table names, existing spills or executable content.",
+  scope:
+    "Assistant formulas may only reference cells in the approved selection.",
+  range:
+    "Assistant formula ranges must join two cells of the approved selection, such as A1:B2. Whole rows, whole columns and calculated or chained range ends are not allowed.",
+  token:
+    "Named ranges and unsupported formula tokens are not allowed in assistant changes.",
+};
+const assistantFormulaReferenceTokens = [
+  "Sheet",
+  "SheetQuoted",
+  "FormulaErrorT",
+  "RefError",
+  "OpenSquareParen",
+  "CloseSquareParen",
+];
+/* Tokens that are a single name or value to the engine's name lookup. */
+const assistantFormulaWordTokens = [
+  "Cell",
+  "Boolean",
+  "Number",
+  "Name",
+  "Column",
+];
+/* Token types that need no further check. Anything not listed is refused. */
+const assistantFormulaPlainTokens = [
+  "String",
+  "Number",
+  "Boolean",
+  "Comma",
+  "Semicolon",
+  "OpenParen",
+  "CloseParen",
+  "OpenCurlyParen",
+  "CloseCurlyParen",
+  "MulOp",
+  "PlusOp",
+  "DivOp",
+  "MinOp",
+  "ConcatOp",
+  "ExOp",
+  "PercentOp",
+  "NeqOp",
+  "GteOp",
+  "LteOp",
+  "GtOp",
+  "EqOp",
+  "LtOp",
+];
+/** Engine tokens of a formula, with `start` and `end` as positions in the formula text. */
+function lexAssistantFormula(formulaText) {
+  const bodyStart = formulaText.startsWith("=") ? 1 : 0;
+  let lexedTokens,
+    unreadableCharacter = "";
+  try {
+    lexedTokens = formulaLexer.lex(formulaText.slice(bodyStart)).tokens;
+  } catch (error) {
+    unreadableCharacter = formulaText[bodyStart + error?.details?.offset] ?? "";
+  }
+  (assertCondition(
+    lexedTokens || !/[!|\\#]/.test(unreadableCharacter),
+    assistantFormulaMessages.reference,
+  ),
+    assertCondition(lexedTokens, assistantFormulaMessages.token));
+  const tokens = [];
+  for (const lexedToken of lexedTokens) {
+    const token = {
+        type: lexedToken.tokenType.name,
+        text: lexedToken.image,
+        start: bodyStart + lexedToken.startOffset,
+        end: bodyStart + lexedToken.endOffset + 1,
+      },
+      previousToken = tokens.at(-1);
+    /*
+     * "2E5" lexes as the number 2 directly followed by cell E5. The engine
+     * never reads a cell written there: LET takes the text as a number and
+     * every other formula stops with a syntax error. It is a number here too.
+     */
+    previousToken?.type === "Number" &&
+    previousToken.end === token.start &&
+    token.type === "Cell" &&
+    /^\d+\.?\d*$/.test(previousToken.text) &&
+    /^E[1-9]\d*$/i.test(token.text)
+      ? ((previousToken.text += token.text), (previousToken.end = token.end))
+      : tokens.push(token);
+  }
+  return tokens;
+}
+/** Positions of the names a formula binds with LET or LAMBDA, as the engine scopes them. */
+function findLocalFormulaNames(formulaText) {
+  const localNamePositions = new Set();
+  walkFormulaNodes(
+    tokenizeFormulaText(formulaText),
+    (node, boundNames, isCallee, isBindingDeclaration) => {
+      (isBindingDeclaration ||
+        (!node.qualifier && boundNames.has(normalizeBindingName(node.name)))) &&
+        localNamePositions.add(`${node.start}:${node.end}`);
+    },
+  );
+  return localNamePositions;
+}
 function validateAssistantFormula(formulaText, selectedAddresses) {
-  let formulaWithoutStrings = formulaText.replace(/"(?:[^"]|"")*"/g, '""');
-  if (
-    (assertCondition(
-      !/[!\[\]|\\#]/.test(formulaWithoutStrings),
-      "Assistant formulas cannot reference other worksheets, external workbooks, table names, existing spills or executable content.",
+  const tokens = lexAssistantFormula(formulaText);
+  (assertCondition(
+    !tokens.some((token) =>
+      assistantFormulaReferenceTokens.includes(token.type),
     ),
+    assistantFormulaMessages.reference,
+  ),
     assertCondition(
       !/(?:https?:|javascript:|data:|file:)/i.test(formulaText),
       "Assistant formulas cannot contain network or executable URLs.",
+    ));
+  const localNamePositions = tokens.some(
+      (token) =>
+        token.type === "Function" && /^(?:LET|LAMBDA)\($/i.test(token.text),
+    )
+      ? findLocalFormulaNames(formulaText)
+      : new Set(),
+    isLocalName = (start, end) => localNamePositions.has(`${start}:${end}`),
+    addressOf = (cellToken) => cellToken.text.replace(/\$/g, "").toUpperCase();
+  for (const token of tokens)
+    token.type === "Function" &&
+      assertCondition(
+        nonVolatileFunctionNameSet.has(token.text.slice(0, -1).toUpperCase()) ||
+          isLocalName(token.start, token.end - 1),
+        `Assistant formula function ${token.text.slice(0, -1)} is not allowed.`,
+      );
+  for (const token of tokens)
+    token.type === "Cell" &&
+      assertCondition(
+        selectedAddresses.has(addressOf(token)),
+        assistantFormulaMessages.scope,
+      );
+  tokens.forEach((token, tokenIndex) => {
+    if (token.type !== "Colon") return;
+    /*
+     * The engine turns a number, a name or a calculated value beside ":" into
+     * a whole row or column, and joins a chain such as A1:B2:C3 into one
+     * range. Only one approved cell on each side is a range here.
+     */
+    const firstToken = tokens[tokenIndex - 1],
+      lastToken = tokens[tokenIndex + 1];
+    assertCondition(
+      firstToken?.type === "Cell" &&
+        lastToken?.type === "Cell" &&
+        tokens[tokenIndex - 2]?.type !== "Colon" &&
+        tokens[tokenIndex + 2]?.type !== "Colon",
+      assistantFormulaMessages.range,
+    );
+    const firstCell = parseCellAddress(addressOf(firstToken)),
+      lastCell = parseCellAddress(addressOf(lastToken));
+    for (
+      let row = Math.min(firstCell.row, lastCell.row);
+      row <= Math.max(firstCell.row, lastCell.row);
+      row++
+    )
+      for (
+        let col = Math.min(firstCell.col, lastCell.col);
+        col <= Math.max(firstCell.col, lastCell.col);
+        col++
+      )
+        assertCondition(
+          selectedAddresses.has(`${columnNumberToLetters(col)}${row}`),
+          assistantFormulaMessages.scope,
+        );
+  });
+  tokens.forEach((token, tokenIndex) => {
+    const nextToken = tokens[tokenIndex + 1];
+    (assertCondition(
+      ["Function", "Cell", "Colon"].includes(token.type) ||
+        (["Name", "Column"].includes(token.type)
+          ? isLocalName(token.start, token.end)
+          : assistantFormulaPlainTokens.includes(token.type)),
+      assistantFormulaMessages.token,
     ),
-    /\b(?:LET|LAMBDA)\s*\(/i.test(formulaWithoutStrings))
-  ) {
-    const replacements = [];
-    walkFormulaNodes(
-      tokenizeFormulaText(formulaWithoutStrings),
-      (node, boundNames, isCallee, isBindingDeclaration) => {
-        (isBindingDeclaration ||
-          (!node.qualifier &&
-            boundNames.has(normalizeBindingName(node.name)))) &&
-          replacements.push({
-            start: node.start,
-            end: node.end,
-            value: isCallee ? "SUM" : "0",
-          });
+      /*
+       * Written without a gap, two of these ("TRUE1", "FALSEA1") are one
+       * defined name to the engine's name lookup, not two tokens.
+       */
+      assertCondition(
+        !(
+          assistantFormulaWordTokens.includes(token.type) &&
+          nextToken?.start === token.end &&
+          [...assistantFormulaWordTokens, "Function"].includes(nextToken.type)
+        ),
+        assistantFormulaMessages.token,
+      ));
+  });
+}
+/**
+ * A calculator for a formula an assistant supplied. The formula can read the
+ * current values of the approved cells and nothing else: any other cell, a
+ * defined name, or a database criterion that reaches outside the selection is
+ * #BLOCKED! and makes readWasRefused() true. This holds whatever
+ * validateAssistantFormula let through.
+ */
+function createApprovedSelectionCalculator(
+  workbook,
+  sheetId,
+  approvedAddresses,
+  approvedValues = calculateWorkbookWithSettings(workbook),
+) {
+  let wasRefused = false;
+  const refuse = () => ((wasRefused = true), false),
+    cellKeyPrefix = `${sheetId}:`,
+    calculator = evaluateWorkbookFormulas(
+      workbook,
+      {},
+      {
+        allowRead: (readSheetId, address) =>
+          (readSheetId === sheetId &&
+            approvedAddresses.has(address.replace(/\$/g, "").toUpperCase())) ||
+          refuse(),
+        allowName: refuse,
+        allowDatabaseCriterion: (criterionSheetId, criterionFormula) => {
+          if (criterionSheetId !== sheetId) return refuse();
+          try {
+            return (
+              validateAssistantFormula(criterionFormula, approvedAddresses),
+              true
+            );
+          } catch {
+            return refuse();
+          }
+        },
+        step: () => {},
+      },
+      /*
+       * Approved cells keep the values the workbook has already calculated,
+       * so their own precedents, which may lie outside the selection, are
+       * never read again here.
+       */
+      {
+        dateContext: approvedValues.getDateContext(),
+        check: () => undefined,
+        read: () => {},
+        enter: () => {},
+        leave: () => {},
+        cycle: () => {},
+        value: (cellKey) =>
+          cellKey.startsWith(cellKeyPrefix) &&
+          approvedAddresses.has(cellKey.slice(cellKeyPrefix.length))
+            ? approvedValues.getTypedValue(
+                sheetId,
+                cellKey.slice(cellKeyPrefix.length),
+              )
+            : undefined,
       },
     );
-    for (const replacement of replacements.sort(
-      (leftReplacement, rightReplacement) =>
-        rightReplacement.start - leftReplacement.start,
-    ))
-      formulaWithoutStrings =
-        formulaWithoutStrings.slice(0, replacement.start) +
-        replacement.value +
-        formulaWithoutStrings.slice(replacement.end);
-  }
-  const functionCallMatches = [
-    ...formulaWithoutStrings.matchAll(/([A-Z_][A-Z0-9_.]*)\s*\(/gi),
-  ];
-  for (const functionCallMatch of functionCallMatches)
-    assertCondition(
-      nonVolatileFunctionNameSet.has(functionCallMatch[1].toUpperCase()),
-      `Assistant formula function ${functionCallMatch[1]} is not allowed.`,
-    );
-  for (const cellReferenceMatch of formulaWithoutStrings.matchAll(
-    new RegExp(
-      "(?<![A-Z0-9_.])\\$?([A-Z]{1,3})\\$?([1-9]\\d*)(?![A-Z0-9_]|\\s*\\()",
-      "gi",
-    ),
-  ))
-    assertCondition(
-      selectedAddresses.has(
-        `${cellReferenceMatch[1].toUpperCase()}${cellReferenceMatch[2]}`,
-      ),
-      "Assistant formulas may only reference cells in the approved selection.",
-    );
-  const residualFormula = formulaWithoutStrings
-    .replace(/([A-Z_][A-Z0-9_.]*)\s*\(/gi, "(")
-    .replace(/\$?[A-Z]{1,3}\$?[1-9]\d*(?![A-Z0-9_])/gi, "0")
-    .replace(/""/g, "0")
-    .replace(/\b(?:TRUE|FALSE)\b/gi, "0")
-    .replace(/\d+(?:\.\d+)?(?:E[+-]?\d+)?/gi, "0");
-  assertCondition(
-    !/[A-Z_]/i.test(residualFormula),
-    "Named ranges and unsupported formula tokens are not allowed in assistant changes.",
-  );
+  return ((calculator.readWasRefused = () => wasRefused), calculator);
 }
 function validateProposedCell(cell, selectedAddresses) {
   (assertCondition(
@@ -895,6 +1090,7 @@ function validateProposedCalculation(workbook, assistantSelection, proposal) {
         step: () => {},
       },
     );
+  let scopedCalculator;
   for (const patch of mergedProposal.patches) {
     if (
       typeof patch.cell.raw != "string" ||
@@ -902,6 +1098,26 @@ function validateProposedCalculation(workbook, assistantSelection, proposal) {
       patch.cell.literal
     )
       continue;
+    /*
+     * Defence in depth for validateAssistantFormula: the proposed formula is
+     * first calculated where it can read only the approved cells, and is
+     * refused if it tried to read anything else.
+     */
+    ((scopedCalculator ??= createApprovedSelectionCalculator(
+      workbookWithPatches,
+      targetSheet.id,
+      selectedAddresses,
+      calculator,
+    )),
+      scopedCalculator.evaluateFormula(
+        targetSheet.id,
+        patch.address,
+        patch.cell.raw,
+      ),
+      assertCondition(
+        !scopedCalculator.readWasRefused(),
+        assistantFormulaMessages.scope,
+      ));
     const calculatedValue = calculator(targetSheet.id, patch.address);
     (assertCondition(
       calculatedValue !== "#LIMIT!",
@@ -1079,6 +1295,7 @@ export {
   buildAssistantSelectionContext,
   buildLocalDemoProposal,
   columnNumberToLetters,
+  createApprovedSelectionCalculator,
   getFileExtension,
   hasOnlyAllowedKeys,
   identifierSchema,

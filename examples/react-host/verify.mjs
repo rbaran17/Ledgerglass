@@ -178,6 +178,14 @@ try {
     "PASS /api/propose answers a selection context with a valid proposal that sums B2:B4 into B5",
   );
 
+  // A request target that is not a URL ("//") or not valid percent-encoding ("/%") gets 400.
+  // The checks after this one show that the server is still running.
+  for (const target of ["//", "/%"])
+    assert.equal((await fetch(`${baseUrl}${target}`)).status, 400, target);
+  console.log(
+    "PASS request targets that are not URLs get 400 and the server keeps running",
+  );
+
   // Reset restores the starting values
   await page.getByRole("button", { name: "Reset" }).click();
   assert.equal(

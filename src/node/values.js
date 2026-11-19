@@ -9,14 +9,19 @@ import { getWorkbookCalculation } from "../app/03-workbook-model.js";
  */
 export function calculateWorkbookValues(workbook) {
   const { calculator, report } = getWorkbookCalculation(workbook);
-  const sheets = {};
-  for (const sheet of workbook.sheets) {
-    const values = {};
-    for (const address of Object.keys(sheet.cells)) {
-      const result = calculator.getTypedValue(sheet.id, address);
-      values[address] = { type: result.type, value: result.value };
-    }
-    sheets[sheet.name] = values;
-  }
+  // Object.fromEntries makes every name the object's own property. Plain assignment does not
+  // for a sheet named "__proto__": it would replace the object's prototype, and the sheet
+  // would be missing from Object.keys and JSON.stringify.
+  const sheets = Object.fromEntries(
+    workbook.sheets.map((sheet) => [
+      sheet.name,
+      Object.fromEntries(
+        Object.keys(sheet.cells).map((address) => {
+          const result = calculator.getTypedValue(sheet.id, address);
+          return [address, { type: result.type, value: result.value }];
+        }),
+      ),
+    ]),
+  );
   return { report, sheets };
 }

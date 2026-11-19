@@ -8,7 +8,6 @@ export {
 export {
   builtinFunctionNames,
   databaseFunctionNames,
-  getWorkbookCalculation,
   normalizeWorkbookInput,
   statisticalFunctionNames,
 } from "../app/03-workbook-model.js";

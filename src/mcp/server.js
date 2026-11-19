@@ -15,7 +15,6 @@ import { z } from "zod";
 import {
   databaseFunctionNames,
   dateFunctionNames,
-  getWorkbookCalculation,
   statisticalFunctionNames,
   supportedFinancialFunctionNames,
   builtinFunctionNames,
@@ -24,6 +23,7 @@ import {
 } from "./model.js";
 import {
   buildAssistantSelectionContext,
+  createApprovedSelectionCalculator,
   nonVolatileFunctionNameSet,
   resolveAssistantSelection,
   validateAssistantFormula,
@@ -217,7 +217,7 @@ function createWorkbookMcpServer(host) {
         proposalFunctionCount: nonVolatileFunctionNameSet.size,
         volatileFunctions: VOLATILE_FUNCTIONS,
         proposals:
-          "Proposed formulas may use non-volatile supported functions and may only reference cells in the approved selection.",
+          "Proposed formulas may use non-volatile supported functions and may only reference cells in the approved selection. A range joins two of those cells, as in A1:B2; whole rows, whole columns, defined names and other sheets are refused.",
       },
       customFunctions: {
         execution:
@@ -315,7 +315,7 @@ function createWorkbookMcpServer(host) {
     {
       title: "Evaluate a formula",
       description:
-        "Calculates a formula against the current workbook without storing it. The formula may only use allowed functions and cells in the approved selection.",
+        "Calculates a formula against the current workbook without storing it. The formula may only use allowed functions and cells in the approved selection, and it cannot read anything else.",
       inputSchema: {
         formula: z.string().min(2).max(4096).describe('Starts with "="'),
         address: z
@@ -330,7 +330,11 @@ function createWorkbookMcpServer(host) {
     },
     guarded(({ formula, address }) => {
       if (!formula.startsWith("=")) throw Error('A formula starts with "=".');
-      const current = context();
+      const workbook = host.getWorkbook();
+      const current = buildAssistantSelectionContext(
+        workbook,
+        host.getSelection(),
+      );
       const approved = new Set(current.cells.map((cell) => cell.address));
       const evaluationAddress = (
         address ?? current.cells[0].address
@@ -338,16 +342,27 @@ function createWorkbookMcpServer(host) {
       if (!approved.has(evaluationAddress))
         throw Error("That address is outside the approved selection.");
       validateAssistantFormula(formula, approved);
-      const { calculator } = getWorkbookCalculation(host.getWorkbook());
+      // Second guard: this calculator can read the approved cells and nothing
+      // else, whatever the check above let through.
+      const calculator = createApprovedSelectionCalculator(
+        workbook,
+        current.sheetId,
+        approved,
+      );
+      const result = calculator.evaluateFormula(
+        current.sheetId,
+        evaluationAddress,
+        formula,
+      );
+      if (calculator.readWasRefused())
+        throw Error(
+          "Assistant formulas may only reference cells in the approved selection.",
+        );
       return {
         formula,
         address: evaluationAddress,
         revision: current.revision,
-        result: calculator.evaluateFormula(
-          current.sheetId,
-          evaluationAddress,
-          formula,
-        ),
+        result,
       };
     }),
   );

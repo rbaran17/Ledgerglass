@@ -68,7 +68,7 @@ docker run --rm -i -v /absolute/path/data:/data ledgerglass-mcp \
 | `workbook_get_context`                 | none                          | Workbook id and revision, sheet, range, and each cell's stored content (`raw`) and calculated `value`.                                |
 | `workbook_read_range`                  | `range`                       | The cells of a range inside the selection. A range outside it is refused.                                                             |
 | `workbook_inspect_formula`             | `formula`                     | Functions and references used, unsupported or volatile functions, and whether the formula could be proposed (with the reason if not). |
-| `workbook_evaluate_formula`            | `formula`, optional `address` | The calculated result, without storing the formula.                                                                                   |
+| `workbook_evaluate_formula`            | `formula`, optional `address` | The calculated result, without storing the formula. The formula can read the selection's cells and nothing else.                      |
 | `workbook_get_formula_contracts`       | optional `functions`          | For each function: whether it is supported, its family, whether it is volatile and whether proposals may use it.                      |
 | `workbook_check_formula_compatibility` | none                          | Formulas in the selection that use unsupported or volatile functions, reference other sheets or evaluate to an error.                 |
 | `workbook_run_audit_checks`            | none                          | Findings that each cite a cell: error values, numbers stored as text, typed-in numbers inside formulas, constants in formula columns. |
@@ -91,7 +91,7 @@ A failed call returns `isError: true` with a plain-language message, for example
 }
 ```
 
-A proposal is refused if it names another workbook or an older revision, cites or edits a cell outside the selection, edits a cell twice, carries unexpected fields, or contains a formula that uses a volatile or unsupported function or references anything outside the selection. These are the same checks the application applies to its own assistant's proposals.
+A proposal is refused if it names another workbook or an older revision, cites or edits a cell outside the selection, edits a cell twice, carries unexpected fields, or contains a formula that uses a volatile or unsupported function or references anything outside the selection. In a formula, a range joins two cells of the selection, as in `B2:B4`; whole rows and columns, defined names, other sheets and range ends that are calculated or chained (`A1:B2:C3`) are refused. These are the same checks the application applies to its own assistant's proposals.
 
 ## Embedding it in your own host
 
