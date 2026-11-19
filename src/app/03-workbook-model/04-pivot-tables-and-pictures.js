@@ -27,6 +27,7 @@ import {
   sha256HexDigest,
   supportedFunctionNames,
   normalizeFunctionName,
+  isBooleanConstantName,
   parseFormulaTree,
 } from "../01-schemas-date-functions-and-validation.js";
 import { assertSheetUnprotected } from "./01-cell-styles-and-themes.js";
@@ -2301,6 +2302,7 @@ const aggregateFunctionNames = [
 function findScopedDefinedName(nameReference, workbook, currentSheetId) {
   if (
     nameReference.cell ||
+    (!nameReference.qualifier && isBooleanConstantName(nameReference.name)) ||
     (nameReference.call &&
       !nameReference.qualifier &&
       builtinFunctionNames.includes(normalizeFunctionName(nameReference.name)))

@@ -590,7 +590,10 @@ function validateSavedRecipeMetadata(metadataInput, workbook) {
 const normalizeFunctionName = (rawFunctionName) =>
     rawFunctionName.replace(/^_xlfn\.(?:_xlws\.)?/i, "").toUpperCase(),
   normalizeBindingName = (rawBindingName) =>
-    rawBindingName.replace(/^_xlpm\./i, "").toLowerCase();
+    rawBindingName.replace(/^_xlpm\./i, "").toLowerCase(),
+  /* TRUE and FALSE are the boolean constants, as in Excel: an unqualified use
+     of either word, in any letter case, is never read as a defined name. */
+  isBooleanConstantName = (name) => /^(?:TRUE|FALSE)$/i.test(name);
 function isValidFormulaName(formulaName, isLambdaParameter = false) {
   return (
     (formulaName = formulaName.replace(/^_xlpm\./i, "")),
@@ -2520,6 +2523,7 @@ export {
   estimateValueFootprintBytes,
   measureSerializedBytes,
   normalizeBindingName,
+  isBooleanConstantName,
   resolveLocalDateTime,
   validateExtensionValue,
   canonicalJsonStringify,

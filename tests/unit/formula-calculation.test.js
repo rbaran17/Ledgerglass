@@ -2,7 +2,9 @@ import { describe, expect, test } from "vitest";
 import {
   createBlankWorkbook,
   getWorkbookCalculation,
+  normalizeWorkbookInput,
 } from "../../src/app/03-workbook-model.js";
+import { inspectFormulaDependencies } from "../../src/app/12-consolidation-and-dependency-inspection.js";
 
 /**
  * Builds a workbook whose first sheet holds `cells` (address -> raw input) and,
@@ -225,5 +227,121 @@ describe("circular references", () => {
     expect(value("A1")).toMatchObject({ type: "error", value: "#CYCLE!" });
     expect(value("A2")).toMatchObject({ type: "error", value: "#CYCLE!" });
     expect(report.cycles).toHaveLength(1);
+  });
+});
+
+describe("TRUE and FALSE are the constants, never a defined name", () => {
+  const elsewhere = 987654;
+
+  /**
+   * A workbook whose G7 holds `elsewhere`, with `names` (name -> options) all
+   * referring to G7, plus `cells` (address -> raw input) on the first sheet.
+   */
+  function withNamesOnG7(names, cells = {}) {
+    const workbook = createBlankWorkbook("Unit");
+    const sheet = workbook.sheets[0];
+    sheet.cells.G7 = { raw: elsewhere };
+    for (const [address, raw] of Object.entries(cells))
+      sheet.cells[address] = { raw };
+    workbook.definedNames = Object.entries(names).map(([name, options]) => ({
+      name,
+      refersTo: options.refersTo ?? "=Sheet1!$G$7",
+      ...(options.sheetScoped ? { scopeSheetId: sheet.id } : {}),
+    }));
+    const { calculator } = getWorkbookCalculation(workbook);
+    return {
+      workbook,
+      value: (address) => calculator.getTypedValue(sheet.id, address),
+      evaluate: (formula) =>
+        calculator.evaluateFormula(sheet.id, "A1", formula),
+    };
+  }
+
+  test("an ordinary formula uses the constant when a name is called TRUE or FALSE", () => {
+    const { value } = withNamesOnG7(
+      { TRUE: {}, FALSE: {} },
+      {
+        A1: "=TRUE",
+        A2: "=FALSE",
+        A3: "=IF(TRUE,1,2)",
+        A4: "=IF(FALSE,1,2)",
+        A5: "=TRUE+0",
+      },
+    );
+    expect(value("A1")).toMatchObject({ type: "boolean", value: true });
+    expect(value("A2")).toMatchObject({ type: "boolean", value: false });
+    expect(value("A3")).toMatchObject({ type: "number", value: 1 });
+    expect(value("A4")).toMatchObject({ type: "number", value: 2 });
+    expect(value("A5")).toMatchObject({ type: "number", value: 1 });
+  });
+
+  test("a LET formula uses the constant too, so both ways of evaluating agree", () => {
+    const { value, evaluate } = withNamesOnG7(
+      { TRUE: {}, FALSE: {} },
+      { A1: "=LET(x,1,TRUE)", A2: "=LET(x,1,IF(FALSE,x,2))" },
+    );
+    expect(value("A1")).toMatchObject({ type: "boolean", value: true });
+    expect(value("A2")).toMatchObject({ type: "number", value: 2 });
+    expect(evaluate("=TRUE+0")).toBe(1);
+    expect(evaluate("=LET(x,1,TRUE+0)")).toBe(1);
+    expect(evaluate("=FALSE+0")).toBe(0);
+    expect(evaluate("=LET(x,1,FALSE+0)")).toBe(0);
+  });
+
+  test("the letter case and the scope of the name make no difference", () => {
+    const { evaluate } = withNamesOnG7({
+      True: {},
+      false: { sheetScoped: true },
+    });
+    expect(evaluate("=TRUE+0")).toBe(1);
+    expect(evaluate("=IF(FALSE,1,2)")).toBe(2);
+    expect(evaluate("=LET(x,1,TRUE+0)")).toBe(1);
+  });
+
+  test("the constants hold when a LAMBDA name sends every formula down the LET path", () => {
+    const { evaluate } = withNamesOnG7({
+      TRUE: {},
+      FALSE: {},
+      Twice: { refersTo: "=LAMBDA(x,x*2)" },
+    });
+    expect(evaluate("=TRUE+0")).toBe(1);
+    expect(evaluate("=IF(FALSE,1,2)")).toBe(2);
+    expect(evaluate("=Twice(TRUE+0)")).toBe(2);
+  });
+
+  test("a parameter prefix does not reach the name either", () => {
+    const { evaluate } = withNamesOnG7({ TRUE: {} });
+    expect(evaluate("=LET(x,1,_xlpm.TRUE+0)")).toBe(1);
+  });
+
+  test("a worksheet-qualified reference still reaches such a name", () => {
+    const { evaluate } = withNamesOnG7({ TRUE: {} });
+    expect(evaluate("=Sheet1!TRUE+0")).toBe(elsewhere);
+    expect(evaluate("=LET(x,1,Sheet1!TRUE+0)")).toBe(elsewhere);
+  });
+
+  test("a workbook that already has such a name still loads and keeps it", () => {
+    const { workbook } = withNamesOnG7({ TRUE: {}, False: {} });
+    expect(normalizeWorkbookInput(workbook).definedNames).toEqual([
+      { name: "TRUE", refersTo: "=Sheet1!$G$7" },
+      { name: "False", refersTo: "=Sheet1!$G$7" },
+    ]);
+  });
+
+  test("the cell behind such a name is not listed as a precedent", () => {
+    const { workbook } = withNamesOnG7(
+      { TRUE: {}, Rate: {} },
+      { A1: 5, B1: "=IF(TRUE,A1,0)", B2: "=Rate+A1" },
+    );
+    const precedents = (address) =>
+      inspectFormulaDependencies(workbook, {
+        sheetId: workbook.sheets[0].id,
+        address,
+        direction: "precedents",
+        depth: 1,
+        limits: { maxFormulaCells: 5000, maxNodes: 500, maxReferences: 10000 },
+      });
+    expect(JSON.stringify(precedents("B1"))).not.toContain("G7");
+    expect(JSON.stringify(precedents("B2"))).toContain("G7");
   });
 });

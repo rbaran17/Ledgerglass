@@ -13,6 +13,7 @@ import {
   normalizeDatePolicy,
   dateSystemMaxSerial,
   fingerprintCanonicalValue,
+  isBooleanConstantName,
 } from "../01-schemas-date-functions-and-validation.js";
 import {
   fileImportLimits,
@@ -106,6 +107,13 @@ function applyDefinedNameOperation(workbook, operation, options = {}) {
       workbook,
     )[0];
   else if (operation.kind !== "delete") throw Error("Unknown name operation.");
+  if (
+    (operation.kind === "create" || operation.kind === "rename") &&
+    isBooleanConstantName(newDefinition.name)
+  )
+    throw Error(
+      "TRUE and FALSE are the boolean constants and cannot be used as names.",
+    );
   if (
     operation.kind === "update" &&
     (existingName.name !== newDefinition.name ||
