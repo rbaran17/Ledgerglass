@@ -8,6 +8,7 @@ import {
   tokenizeFormulaText,
   fingerprintCanonicalValue,
   normalizeBindingName,
+  isBooleanConstantName,
   normalizeDatePolicy,
 } from "./01-schemas-date-functions-and-validation.js";
 import { workbookLimits } from "./02-text-and-financial-functions.js";
@@ -611,19 +612,20 @@ function inspectFormulaDependencies(workbook, request) {
                 (scanIndex += sheetQualifiedNameText.length));
               continue;
             }
-            const bareDefinedName =
-              workbook.definedNames?.find(
-                (definedName) =>
-                  definedName.scopeSheetId === contextSheetId &&
-                  definedName.name.toLowerCase() ===
-                    bareSheetName.toLowerCase(),
-              ) ??
-              workbook.definedNames?.find(
-                (definedName) =>
-                  !definedName.scopeSheetId &&
-                  definedName.name.toLowerCase() ===
-                    bareSheetName.toLowerCase(),
-              );
+            const bareDefinedName = isBooleanConstantName(bareSheetName)
+              ? undefined
+              : (workbook.definedNames?.find(
+                  (definedName) =>
+                    definedName.scopeSheetId === contextSheetId &&
+                    definedName.name.toLowerCase() ===
+                      bareSheetName.toLowerCase(),
+                ) ??
+                workbook.definedNames?.find(
+                  (definedName) =>
+                    !definedName.scopeSheetId &&
+                    definedName.name.toLowerCase() ===
+                      bareSheetName.toLowerCase(),
+                ));
             if (bareDefinedName) {
               const bareNameKey = `${bareDefinedName.scopeSheetId ?? ""}:${bareDefinedName.name.toLowerCase()}`;
               nameChain.includes(bareNameKey)
@@ -640,7 +642,7 @@ function inspectFormulaDependencies(workbook, request) {
                     originToken ?? bareSheetName,
                   );
             } else
-              ["TRUE", "FALSE"].includes(bareSheetName.toUpperCase()) ||
+              isBooleanConstantName(bareSheetName) ||
                 addIssue(
                   cell.key,
                   "missing",

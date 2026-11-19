@@ -11,6 +11,7 @@ import {
   walkFormulaNodes,
   tokenizeFormulaText,
   normalizeBindingName,
+  isBooleanConstantName,
   validateLetLambdaCall,
   validateBindingName,
   normalizeFunctionName,
@@ -1753,7 +1754,7 @@ function evaluateReusableFormula(
       const bindingName = normalizeBindingName(symbolNode.name);
       if (!symbolNode.qualifier && symbolBindings.has(bindingName))
         return symbolBindings.get(bindingName);
-      if (!symbolNode.qualifier && /^(?:TRUE|FALSE)$/i.test(symbolNode.name))
+      if (!symbolNode.qualifier && isBooleanConstantName(bindingName))
         return bindingName === "true";
       const resolvedName = resolveNameBinding(symbolNode, symbolSheetId);
       if (!resolvedName)

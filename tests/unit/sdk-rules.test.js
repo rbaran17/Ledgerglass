@@ -657,6 +657,53 @@ describe("defined names", () => {
     ).toThrow("This workbook is read-only.");
   });
 
+  test("applyDefinedNameOperation refuses TRUE and FALSE as a new name, in any letter case", () => {
+    const { next } = workbookWithRate();
+    const reserved =
+      "TRUE and FALSE are the boolean constants and cannot be used as names.";
+    for (const name of ["TRUE", "false", "True"])
+      expect(() =>
+        applyDefinedNameOperation(next, {
+          kind: "create",
+          definition: { name, refersTo: "=Sheet1!$A$1" },
+        }),
+      ).toThrow(reserved);
+    expect(() =>
+      applyDefinedNameOperation(next, {
+        kind: "rename",
+        name: "Rate",
+        newName: "False",
+      }),
+    ).toThrow(reserved);
+  });
+
+  test("a name called TRUE that a workbook already has can be renamed away or deleted", () => {
+    const workbook = sampleWorkbook();
+    workbook.definedNames = [{ name: "TRUE", refersTo: "=Sheet1!$A$2" }];
+    workbook.sheets[0].cells.C1 = { raw: "=IF(TRUE,1,2)" };
+    workbook.sheets[0].cells.C2 = { raw: "=Sheet1!TRUE+1" };
+    const renamed = applyDefinedNameOperation(workbook, {
+      kind: "rename",
+      name: "TRUE",
+      newName: "Rate",
+    });
+    expect(renamed.changes).toEqual([
+      expect.objectContaining({
+        address: "C2",
+        before: "=Sheet1!TRUE+1",
+        after: "=Sheet1!Rate+1",
+      }),
+    ]);
+    expect(renamed.next.sheets[0].cells.C1).toEqual({ raw: "=IF(TRUE,1,2)" });
+    delete workbook.sheets[0].cells.C2;
+    const deleted = applyDefinedNameOperation(workbook, {
+      kind: "delete",
+      name: "TRUE",
+    });
+    expect(deleted.dependencies).toEqual([]);
+    expect(deleted.next.definedNames).toEqual([]);
+  });
+
   test("a rename rewrites the formulas that use the name", () => {
     const { next } = workbookWithRate();
     next.sheets[0].cells.B1 = { raw: "=Rate*2" };
