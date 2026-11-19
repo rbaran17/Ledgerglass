@@ -62,6 +62,16 @@ This runs the assistant flow (a question, then a change that is checked by the e
 - The direct API path has not been run yet: no API key was available where this was built. The results recorded in [the agent guide](../../docs/AGENT-UI.md#trial-with-a-live-model) come from a different setup, a live Claude Haiku model behind the same endpoint.
 - `LIVE_AGENT_MODULE` names a module whose default export is a responder to use instead of Claude.
 
+## Who may call the endpoint
+
+The example has no sign-in. Any web page open in the same browser can send a `POST` to `http://127.0.0.1:4330/agent`, and with Claude each run is billed, so `ag-ui-endpoint.mjs` refuses what a page on another site can send:
+
+- a body that is not `application/json` gets `415`;
+- an `Origin` other than the server's own gets `403`;
+- a `Host` that is not `localhost` or an IP address gets `403`, which stops a page that reaches the server under a DNS name of its own (DNS rebinding).
+
+`createAgUiEndpoint(respond, { allowedOrigins, allowedHosts })` adds the origins and host names a deployment is reached under. These checks only keep other sites out. A real host must authenticate each caller and tie `threadId` to that caller's session, so that one user cannot continue another user's conversation.
+
 ## Writing your own agent
 
 Any AG-UI 1.0 agent works with `createAgUiAdapter`. To serve one from Node with this example's endpoint, pass a responder to `createAgUiEndpoint(respond)`. A responder is `async (input, { signal }) => ({ text, toolCalls })`, where each tool call is `{ id, name, args }` and `args` is an object. The tools an agent may call are the frontend tools the client sent in `input.tools`: the client runs them and sends the result in its next run. `scripted-agent.mjs` is a short example of reading the selection from `input.context` and answering with a tool call.

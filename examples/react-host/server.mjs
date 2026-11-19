@@ -135,6 +135,12 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+function sendBadRequest(response) {
+  if (!response.headersSent)
+    response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+  response.end("Bad request");
+}
+
 async function handlePropose(request, response) {
   let body;
   try {
@@ -191,14 +197,24 @@ export function startServer({
   host = "127.0.0.1",
 } = {}) {
   const server = createServer((request, response) => {
-    const { pathname } = new URL(request.url, "http://localhost");
+    // Anyone who can reach the port chooses the request target. One that is not a URL ("//")
+    // or not valid percent-encoding ("/%") gets 400; an error left to escape from here or from
+    // serveFile would end the process.
+    let pathname;
+    try {
+      ({ pathname } = new URL(request.url, "http://localhost"));
+    } catch {
+      return sendBadRequest(response);
+    }
     if (request.method === "POST" && pathname === "/api/propose")
       return void handlePropose(request, response);
     if (request.method !== "GET" && request.method !== "HEAD") {
       response.writeHead(405, { Allow: "GET, HEAD, POST" }).end();
       return;
     }
-    return void serveFile(response, pathname);
+    return void serveFile(response, pathname).catch(() =>
+      sendBadRequest(response),
+    );
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);

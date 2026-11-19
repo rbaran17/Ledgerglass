@@ -1,5 +1,5 @@
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { createServer } from "node:http";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { createServer, request as httpRequest } from "node:http";
 import {
   PROPOSE_WORKBOOK_CHANGES_TOOL_NAME,
   createAgUiAdapter,
@@ -758,5 +758,115 @@ describe("createAgUiAdapter against the example agent", () => {
     expect(await response.json()).toEqual({
       error: "Not an AG-UI run input.",
     });
+  });
+});
+
+describe("the example agent endpoint and requests from other sites", () => {
+  const respond = vi.fn(async () => ({ text: "ran" }));
+  const runInput = JSON.stringify({
+    threadId: "t",
+    runId: "r",
+    messages: [{ id: "1", role: "user", content: "spend tokens" }],
+  });
+  let server;
+  let port;
+
+  beforeAll(async () => {
+    const endpoint = createAgUiEndpoint(respond);
+    const configured = createAgUiEndpoint(respond, {
+      allowedOrigins: ["https://app.example.com"],
+      allowedHosts: ["agent.example.com"],
+    });
+    server = createServer((request, response) =>
+      (request.url === "/configured" ? configured : endpoint)(
+        request,
+        response,
+      ),
+    );
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    port = server.address().port;
+  });
+
+  afterAll(async () => {
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  /** The status of one POST. node:http sends the Host and Origin it is given, as a browser would. */
+  function post(headers, path = "/agent") {
+    respond.mockClear();
+    return new Promise((resolve, reject) => {
+      const request = httpRequest(
+        { host: "127.0.0.1", port, path, method: "POST", headers },
+        (response) => {
+          response.resume();
+          response.on("end", () => resolve(response.statusCode));
+        },
+      );
+      request.on("error", reject);
+      request.end(runInput);
+    });
+  }
+  const json = { "Content-Type": "application/json" };
+
+  test("a body that is not sent as application/json is refused with 415", async () => {
+    // A form or a text/plain fetch is all a page on another site can send without a preflight.
+    expect(await post({ "Content-Type": "text/plain" })).toBe(415);
+    expect(
+      await post({ "Content-Type": "application/x-www-form-urlencoded" }),
+    ).toBe(415);
+    expect(await post({})).toBe(415);
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("another site's Origin is refused with 403", async () => {
+    expect(await post({ ...json, Origin: "https://evil.example" })).toBe(403);
+    expect(await post({ ...json, Origin: "null" })).toBe(403);
+    expect(
+      await post({ ...json, Origin: `http://127.0.0.1:${port + 1}` }),
+    ).toBe(403);
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("a Host that is a DNS name is refused with 403, as in DNS rebinding", async () => {
+    // The page and the endpoint share an origin here, so only the Host gives the attack away.
+    const rebound = `evil.example:${port}`;
+    expect(
+      await post({ ...json, Host: rebound, Origin: `http://${rebound}` }),
+    ).toBe(403);
+    expect(await post({ ...json, Host: rebound })).toBe(403);
+    expect(respond).not.toHaveBeenCalled();
+  });
+
+  test("the server's own page and a client without an Origin may run the agent", async () => {
+    for (const host of [
+      `127.0.0.1:${port}`,
+      `localhost:${port}`,
+      `[::1]:${port}`,
+    ]) {
+      expect(
+        await post({ ...json, Host: host, Origin: `http://${host}` }),
+      ).toBe(200);
+      expect(respond).toHaveBeenCalledTimes(1);
+    }
+    expect(await post(json)).toBe(200);
+    expect(respond).toHaveBeenCalledTimes(1);
+  });
+
+  test("allowedOrigins and allowedHosts add the names a deployment is reached under", async () => {
+    const deployed = {
+      ...json,
+      Host: "agent.example.com",
+      Origin: "https://app.example.com",
+    };
+    expect(await post(deployed)).toBe(403);
+    expect(respond).not.toHaveBeenCalled();
+    expect(await post(deployed, "/configured")).toBe(200);
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(
+      await post(
+        { ...deployed, Origin: "https://evil.example" },
+        "/configured",
+      ),
+    ).toBe(403);
   });
 });
