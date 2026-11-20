@@ -471,9 +471,10 @@ describe("assistant formulas stay inside the approved selection", () => {
     expect(calculator.readWasRefused()).toBe(true);
   });
 
-  test("a formula the check accepts is still refused when it reads outside: a defined name called TRUE", async () => {
-    // The formula check cannot see the workbook's names, and the engine expands a name called
-    // TRUE where the check sees the constant. Only the second guard can stop this one.
+  test("a defined name called TRUE does not change a formula the check accepts: TRUE stays the constant", async () => {
+    // The formula check cannot see the workbook's names, so it has to accept TRUE and FALSE.
+    // The engine reads an unqualified TRUE as the constant, never as a name, so nothing outside
+    // the selection is read.
     const workbook = payroll();
     workbook.definedNames = [{ name: "TRUE", refersTo: "=Sheet1!$G$7" }];
     const sheetId = workbook.sheets[0].id;
@@ -487,14 +488,14 @@ describe("assistant formulas stay inside the approved selection", () => {
         "A1",
         formula,
       ),
-    ).toBe(987654);
+    ).toBe(1);
 
     const { call } = await connect(workbook, "A1:B2");
     const evaluated = await call("workbook_evaluate_formula", { formula });
-    expect(evaluated.error).toMatch(/approved selection/);
+    expect(evaluated.result).toBe(1);
     expect(JSON.stringify(evaluated)).not.toMatch(outsideData);
 
-    // The editor's own check of a proposal refuses it the same way.
+    // The editor's own check of a proposal accepts it for the same reason.
     const selection = { sheetId, range: "A1:B2" };
     const proposal = proposalFor(
       workbook,
@@ -507,9 +508,9 @@ describe("assistant formulas stay inside the approved selection", () => {
         buildAssistantSelectionContext(workbook, selection),
       ),
     ).not.toThrow();
-    expect(() =>
-      validateProposedCalculation(workbook, selection, proposal),
-    ).toThrow(/approved selection/);
+    expect(
+      validateProposedCalculation(workbook, selection, proposal).patches,
+    ).toHaveLength(1);
   });
 
   test("the editor's check of a proposal accepts an ordinary formula and refuses one that reads outside", () => {
