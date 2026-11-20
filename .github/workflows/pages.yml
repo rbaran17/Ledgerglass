@@ -20,7 +20,9 @@ concurrency:
 jobs:
   deploy:
     name: Publish dist to GitHub Pages
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 (what ubuntu-latest now resolves to) the deploy step found no
+    # artifact straight after the upload step created it. The last successful run used 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       pages: write
